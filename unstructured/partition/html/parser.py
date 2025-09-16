@@ -83,7 +83,6 @@ from typing import Any, Iterable, Iterator, Mapping, NamedTuple, Sequence, cast
 from lxml import etree
 from typing_extensions import TypeAlias
 
-from unstructured.cleaners.core import clean_bullets
 from unstructured.common.html_table import htmlify_matrix_of_cell_texts
 from unstructured.documents.elements import (
     Address,
@@ -91,8 +90,10 @@ from unstructured.documents.elements import (
     ElementMetadata,
     EmailAddress,
     Image,
+    ListBlock as DocumentListBlock,
     ListItem,
     NarrativeText,
+    CodeSnippet as DocumentCodeSnippet,
     Table,
     Text,
     Title,
@@ -256,20 +257,38 @@ class _ElementAccumulator:
             # -- identifies as a list-item
             if ElementCls is None:
                 return
-            # -- derived ListItem means text starts with a bullet character that needs removing --
-            if ElementCls is ListItem:
-                normalized_text = clean_bullets(normalized_text)
-                if not normalized_text:
-                    return
+            # # -- derived ListItem means text starts with a bullet character that needs removing --
+            # if ElementCls is ListItem:
+            #     normalized_text = clean_bullets(normalized_text)
+            #     if not normalized_text:
+            #         return
 
         category_depth = self._category_depth(ElementCls)
 
+        metadata = ElementMetadata(
+            **_consolidate_annotations(ts.annotation for ts in text_segments),
+            category_depth=category_depth,
+        )
+        try:
+            # -- capture original HTML of the enclosing block element --
+            metadata.html_text = etree.tostring(self._element, encoding="unicode")
+
+            # -- for list items, also capture parent list context for proper markdown conversion --
+            if ElementCls is ListItem:
+                parent = self._element.getparent()
+                if parent is not None and parent.tag in ("ul", "ol"):
+                    # -- create a temporary list with just this item for markdownify --
+                    temp_list = etree.Element(parent.tag)
+                    temp_li = etree.fromstring(metadata.html_text)
+                    temp_list.append(temp_li)
+                    metadata.html_text = etree.tostring(temp_list, encoding="unicode")
+            # -- for list blocks, no special processing needed as they already contain the full list --
+        except Exception:
+            metadata.html_text = None
+
         yield ElementCls(
             normalized_text,
-            metadata=ElementMetadata(
-                **_consolidate_annotations(ts.annotation for ts in text_segments),
-                category_depth=category_depth,
-            ),
+            metadata=metadata,
         )
 
     def _category_depth(self, ElementCls: type[Element]) -> int | None:
@@ -281,12 +300,15 @@ class _ElementAccumulator:
                 else 0
             )
 
-        if ElementCls is Title:
+        if ElementCls is DocumentListBlock:
             return (
-                int(self._element.tag[1]) - 1
-                if self._element.tag in ("h1", "h2", "h3", "h4", "h5", "h6")
+                len([e for e in self._element.iterancestors() if e.tag in ("dl", "ol", "ul")])
+                if self._element.tag in ("ol", "ul")
                 else 0
             )
+
+        if ElementCls is Title:
+            return int(self._element.tag[1]) - 1 if self._element.tag in ("h1", "h2", "h3", "h4", "h5", "h6") else 0
 
         return None
 
@@ -385,9 +407,7 @@ class Flow(etree.ElementBase):
 
         yield from element_accum.flush(ElementCls)
 
-    def _iter_text_segments(
-        self, text: str, q: deque[Flow | Phrasing]
-    ) -> Iterator[TextSegment | Element]:
+    def _iter_text_segments(self, text: str, q: deque[Flow | Phrasing]) -> Iterator[TextSegment | Element]:
         """Generate zero-or-more `TextSegment`s or `Element`s from text and leading phrasing.
 
         Note that while this method is named "._iter_text_segments()", it can also generate
@@ -445,7 +465,7 @@ class Heading(Flow):
 
 
 class ListBlock(Flow):
-    """Either a `<ul>` or `<ol>` element, maybe a `<dl>` element at some point.
+    """Base class for list elements like `<ul>` and `<ol>`.
 
     The primary reason for distinguishing these is because they increment the hierarchy depth for
     lists that are nested inside them.
@@ -454,8 +474,73 @@ class ListBlock(Flow):
     must actually be a child of one of these `<li>` elements.
     """
 
-    # TODO: might want alternate `.iter_elements()` since these can only contain `<li>` elements and
-    # not text nodes (I believe).
+    def iter_elements(self) -> Iterator[Element]:
+        """Generate a single ListBlock element containing the entire list."""
+        # -- collect all text content from this list element --
+        element_accum = self._element_accum
+
+        # -- process text content first --
+        if self.text:
+            for node in self._iter_text_segments(self.text, deque()):
+                if isinstance(node, TextSegment):
+                    element_accum.add(node)
+
+        # -- process all children as text content --
+        for child in self:
+            if child.is_phrasing:
+                # -- phrasing elements contribute text segments --
+                for node in child.iter_text_segments():
+                    if isinstance(node, TextSegment):
+                        element_accum.add(node)
+            else:
+                # -- block elements like <li> inside list should be treated as text content --
+                # -- collect their text content without creating separate elements --
+                if child.tag == "li":
+                    # -- process <li> content as text segments --
+                    for node in self._iter_text_segments(child.text or "", deque()):
+                        if isinstance(node, TextSegment):
+                            element_accum.add(node)
+                    # -- process all children of the <li> (including <p> tags) --
+                    for li_child in child:
+                        if li_child.is_phrasing:
+                            phr = cast(Phrasing, li_child)
+                            for node in phr.iter_text_segments():
+                                if isinstance(node, TextSegment):
+                                    element_accum.add(node)
+                        elif li_child.tag == "p":
+                            # -- process <p> content as text segments --
+                            for node in self._iter_text_segments(li_child.text or "", deque()):
+                                if isinstance(node, TextSegment):
+                                    element_accum.add(node)
+                            # -- process any phrasing children of the <p> --
+                            for p_child in li_child:
+                                if p_child.is_phrasing:
+                                    phr = cast(Phrasing, p_child)
+                                    for node in phr.iter_text_segments():
+                                        if isinstance(node, TextSegment):
+                                            element_accum.add(node)
+                else:
+                    # -- other block elements, process normally --
+                    yield from child.iter_elements()
+
+        # -- flush any remaining accumulated content --
+        yield from element_accum.flush(DocumentListBlock)
+
+
+class OrderedListBlock(ListBlock):
+    """An `<ol>` element for ordered lists."""
+
+    def iter_elements(self) -> Iterator[Element]:
+        """Generate a single ListBlock element containing the entire ordered list."""
+        yield from super().iter_elements()
+
+
+class UnorderedListBlock(ListBlock):
+    """A `<ul>` element for unordered lists."""
+
+    def iter_elements(self) -> Iterator[Element]:
+        """Generate a single ListBlock element containing the entire unordered list."""
+        yield from super().iter_elements()
 
 
 class ListItemBlock(Flow):
@@ -466,12 +551,54 @@ class ListItemBlock(Flow):
 
     _ElementCls = ListItem
 
+    def iter_elements(self) -> Iterator[Element]:
+        """Generate ListItem elements for this <li> element."""
+        # -- collect all text content from this <li> element, including nested <p> tags --
+        element_accum = self._element_accum
+
+        # -- process text and all children as a single unit --
+        q: deque[Flow | Phrasing] = deque(self)
+        yield from self._element_from_text_or_tail(self.text or "", q, self._ElementCls)
+
+        while q:
+            child = q.popleft()
+            if child.is_phrasing:
+                # -- phrasing elements contribute text segments --
+                for node in child.iter_text_segments():
+                    if isinstance(node, TextSegment):
+                        element_accum.add(node)
+            else:
+                # -- block elements like <p> inside <li> should be treated as text content --
+                # -- collect their text content without creating separate elements --
+                if child.tag == "p":
+                    # -- process <p> content as text segments --
+                    for node in self._iter_text_segments(child.text or "", deque()):
+                        if isinstance(node, TextSegment):
+                            element_accum.add(node)
+                    # -- process any phrasing children of the <p> --
+                    p_q: deque[Flow | Phrasing] = deque(child)
+                    while p_q and p_q[0].is_phrasing:
+                        phr = cast(Phrasing, p_q.popleft())
+                        for node in phr.iter_text_segments():
+                            if isinstance(node, TextSegment):
+                                element_accum.add(node)
+                else:
+                    # -- other block elements, process normally --
+                    yield from child.iter_elements()
+                yield from self._element_from_text_or_tail(child.tail or "", q)
+
+        # -- flush any remaining accumulated content --
+        yield from element_accum.flush(self._ElementCls)
+
 
 class Pre(BlockItem):
     """Custom element-class for `<pre>` element.
 
     Can only contain phrasing content.
     """
+
+    # -- Treat <pre> blocks as document-level CodeSnippet elements --
+    _ElementCls = DocumentCodeSnippet
 
     @lazyproperty
     def _element_accum(self) -> _ElementAccumulator:
@@ -497,13 +624,19 @@ class ImageBlock(Flow):
         img_base64 = mime_match.group(2) if mime_match else None
         img_url = None if img_base64 else img_src
 
+        meta = ElementMetadata(
+            image_mime_type=img_mime_type,
+            image_base64=img_base64,
+            image_url=img_url,
+        )
+        try:
+            meta.html_text = etree.tostring(self, encoding="unicode")
+        except Exception:
+            meta.html_text = None
+
         yield Image(
             text=img_alt,
-            metadata=ElementMetadata(
-                image_mime_type=img_mime_type,
-                image_base64=img_base64,
-                image_url=img_url,
-            ),
+            metadata=meta,
         )
 
 
@@ -540,7 +673,12 @@ class TableBlock(Flow):
         if table_text == "":
             return
 
-        yield Table(table_text, metadata=ElementMetadata(text_as_html=html_table))
+        meta = ElementMetadata(text_as_html=html_table)
+        try:
+            meta.html_text = etree.tostring(self, encoding="unicode")
+        except Exception:
+            meta.html_text = None
+        yield Table(table_text, metadata=meta)
 
 
 class RemovedBlock(Flow):
@@ -625,9 +763,7 @@ class Phrasing(etree.ElementBase):
                 yield from cast(Phrasing, child).iter_text_segments(emphasis)
             else:
                 yield from cast(Flow, child).iter_elements()
-                yield from self._iter_text_segments_from_block_tail_and_phrasing(
-                    child.tail or "", q, emphasis
-                )
+                yield from self._iter_text_segments_from_block_tail_and_phrasing(child.tail or "", q, emphasis)
 
     def _iter_tail_segment(self, emphasis: str) -> Iterator[TextSegment]:
         """Generate zero-or-one text-segment for tail of this element.
@@ -663,6 +799,23 @@ class Phrasing(etree.ElementBase):
         while q and q[0].is_phrasing:
             e = cast(Phrasing, q.popleft())
             yield from e.iter_text_segments(emphasis)
+
+
+class CodeSnippet(Phrasing):
+    def _annotation(self, text: str, emphasis: str) -> Annotation:
+        """Add code language from class like 'lang-xxx' to metadata languages.
+
+        The emphasis annotations are preserved from the base implementation and merged
+        with an optional 'languages' field extracted from the class attribute.
+        """
+        base = dict(super()._annotation(text, emphasis))
+        class_attr = (self.get("class") or "").split()
+        languages = [cls[5:] for cls in class_attr if cls.startswith("lang-") and len(cls) > 5]
+        if languages:
+            # -- merge languages into annotations so they consolidate into ElementMetadata --
+            # -- ElementMetadata has a known 'languages' field we can leverage --
+            base["languages"] = languages
+        return MappingProxyType(base)
 
 
 class Anchor(Phrasing):
@@ -722,9 +875,7 @@ class Anchor(Phrasing):
             yield from block_item.iter_elements()
             yield from self._iter_phrasing(block_item.tail or "", q, emphasis)
 
-    def _iter_phrasing(
-        self, text: str, q: deque[Flow | Phrasing], emphasis: str
-    ) -> Iterator[Phrase | Element]:
+    def _iter_phrasing(self, text: str, q: deque[Flow | Phrasing], emphasis: str) -> Iterator[Phrase | Element]:
         """Generate zero-or-more `TextSegment`s or `Element`s from text and leading phrasing.
 
         Note that while this method is named "._iter_phrasing()", it can also generate `Element`
@@ -955,8 +1106,8 @@ element_class_lookup.get_namespace(None).update(
         "p": BlockItem,
         "pre": Pre,
         # -- list blocks --
-        "ol": ListBlock,
-        "ul": ListBlock,
+        "ol": OrderedListBlock,
+        "ul": UnorderedListBlock,
         "li": ListItemBlock,
         # -- image --
         "img": ImageBlock,
@@ -975,7 +1126,7 @@ element_class_lookup.get_namespace(None).update(
         "big": Phrasing,  # -- deprecated --
         "br": LineBreak,  # -- line break --
         "cite": Phrasing,  # -- title of book or article etc. --
-        "code": Phrasing,  # -- monospaced terminal font --
+        "code": CodeSnippet,  # -- monospaced terminal font --
         "data": Phrasing,  # -- similar to `time`, provides machine readable value as attribute --
         "dfn": Phrasing,  # -- definition, like new term in italic when first introduced --
         "kbd": Phrasing,  # -- font that looks like keyboard keys --

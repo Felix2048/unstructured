@@ -113,11 +113,7 @@ class CoordinatesMetadata:
                 if system_name == "RelativeCoordinateSystem"
                 else (
                     TYPE_TO_COORDINATE_SYSTEM_MAP[system_name](width, height)
-                    if (
-                        width is not None
-                        and height is not None
-                        and system_name in TYPE_TO_COORDINATE_SYSTEM_MAP
-                    )
+                    if (width is not None and height is not None and system_name in TYPE_TO_COORDINATE_SYSTEM_MAP)
                     else None
                 )
             )
@@ -398,9 +394,7 @@ class ElementMetadata:
 
         # -- don't serialize empty lists --
         meta_dict: dict[str, Any] = {
-            field_name: value
-            for field_name, value in meta_dict.items()
-            if value != [] and value != {}
+            field_name: value for field_name, value in meta_dict.items() if value != [] and value != {}
         }
 
         # -- serialize sub-object types when present --
@@ -539,9 +533,7 @@ def assign_and_map_hash_ids(elements: list[Element]) -> list[Element]:
     """
     # -- generate sequence number for each element on a page --
     page_numbers = [e.metadata.page_number for e in elements]
-    page_seq_pairs = [
-        seq_on_page for _, group in groupby(page_numbers) for seq_on_page, _ in enumerate(group)
-    ]
+    page_seq_pairs = [seq_on_page for _, group in groupby(page_numbers) for seq_on_page, _ in enumerate(group)]
 
     # -- assign hash IDs to elements --
     old_to_new_mapping = {
@@ -571,13 +563,9 @@ def process_metadata() -> Callable[[Callable[_P, list[Element]]], Callable[_P, l
 
     def decorator(func: Callable[_P, list[Element]]) -> Callable[_P, list[Element]]:
         if func.__doc__:  # noqa: SIM102
-            if (
-                "metadata_filename" in func.__code__.co_varnames
-                and "metadata_filename" not in func.__doc__
-            ):
+            if "metadata_filename" in func.__code__.co_varnames and "metadata_filename" not in func.__doc__:
                 func.__doc__ += (
-                    "\nMetadata Parameters:\n\tmetadata_filename:"
-                    + "\n\t\tThe filename to use in element metadata."
+                    "\nMetadata Parameters:\n\tmetadata_filename:" + "\n\t\tThe filename to use in element metadata."
                 )
 
         @functools.wraps(func)
@@ -616,6 +604,7 @@ class ElementType:
     FIGURE = "Figure"
     CAPTION = "Caption"
     LIST = "List"
+    LIST_BLOCK = "ListBlock"
     LIST_ITEM = "ListItem"
     LIST_ITEM_OTHER = "List-item"
     CHECKED = "Checked"
@@ -688,9 +677,7 @@ class Element(abc.ABC):
         self._element_id = element_id
         self.metadata = ElementMetadata() if metadata is None else metadata
         if coordinates is not None or coordinate_system is not None:
-            self.metadata.coordinates = CoordinatesMetadata(
-                points=coordinates, system=coordinate_system
-            )
+            self.metadata.coordinates = CoordinatesMetadata(points=coordinates, system=coordinate_system)
         self.metadata.detection_origin = detection_origin
         # -- all `Element` instances get a `text` attribute, defaults to the empty string if not
         # -- defined in a subclass.
@@ -904,6 +891,12 @@ class ListItem(Text):
     category = "ListItem"
 
 
+class ListBlock(Text):
+    """ListBlock is an element that contains a complete list (ul or ol)."""
+
+    category = "ListBlock"
+
+
 class Title(Text):
     """A text element for capturing titles."""
 
@@ -1001,6 +994,7 @@ TYPE_TO_TEXT_ELEMENT_MAP: dict[str, type[Text]] = {
     ElementType.FORM: NarrativeText,
     ElementType.VALUE: NarrativeText,
     ElementType.LINK: NarrativeText,
+    ElementType.LIST_BLOCK: ListBlock,
     ElementType.LIST_ITEM: ListItem,
     ElementType.BULLETED_TEXT: ListItem,
     ElementType.LIST_ITEM_OTHER: ListItem,
@@ -1037,13 +1031,9 @@ def _kvform_rehydrate_internal_elements(kv_pairs: list[dict[str, Any]]) -> list[
     # safe to overwrite - deepcopy already happened
     for kv_pair in kv_pairs:
         if kv_pair["key"]["custom_element"] is not None:
-            (kv_pair["key"]["custom_element"],) = elements_from_dicts(
-                [kv_pair["key"]["custom_element"]]
-            )
+            (kv_pair["key"]["custom_element"],) = elements_from_dicts([kv_pair["key"]["custom_element"]])
         if kv_pair["value"] is not None and kv_pair["value"]["custom_element"] is not None:
-            (kv_pair["value"]["custom_element"],) = elements_from_dicts(
-                [kv_pair["value"]["custom_element"]]
-            )
+            (kv_pair["value"]["custom_element"],) = elements_from_dicts([kv_pair["value"]["custom_element"]])
     return cast(list[FormKeyValuePair], kv_pairs)
 
 

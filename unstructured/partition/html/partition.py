@@ -4,10 +4,11 @@
 
 from __future__ import annotations
 
-from typing import IO, Any, Iterator, List, Literal, Optional, cast
+from typing import IO, Any, Callable, Iterator, List, Literal, Optional, cast
 
 import requests
 from lxml import etree
+from markdownify import markdownify
 
 from unstructured.chunking import add_chunking_strategy
 from unstructured.documents.elements import Element, ElementType
@@ -39,6 +40,7 @@ def partition_html(
     image_alt_mode: Optional[Literal["to_text"]] = "to_text",
     extract_image_block_to_payload: bool = False,
     extract_image_block_types: Optional[list[str]] = None,
+    cleaning_callback: Optional[Callable[[etree.Element], etree.Element]] = None,
     **kwargs: Any,
 ) -> list[Element]:
     """Partitions an HTML document into its constituent elements.
@@ -71,6 +73,11 @@ def partition_html(
 
     image_alt_mode (Literal['to_text']):
         When set 'to_text', the v2 parser will include the alternative text of images in the output.
+
+    cleaning_callback
+        An optional callback function that takes an `lxml.etree.Element` (the parsed HTML tree)
+        and returns a modified `lxml.etree.Element`. This is used for custom data cleaning
+        or transformation of the HTML tree before further processing.
     """
     # -- parser rejects an empty str, nip that edge-case in the bud here --
     if text is not None and text.strip() == "" and not file and not filename and not url:
@@ -90,6 +97,8 @@ def partition_html(
         image_alt_mode=image_alt_mode,
         extract_image_block_types=extract_image_block_types,
         extract_image_block_to_payload=extract_image_block_to_payload,
+        cleaning_callback=cleaning_callback,
+        extra_configs=kwargs,
     )
 
     return list(_HtmlPartitioner.iter_elements(opts))
@@ -114,6 +123,8 @@ class HtmlPartitionerOptions:
         image_alt_mode: Optional[Literal["to_text"]] = "to_text",
         extract_image_block_types: Optional[list[str]] = None,
         extract_image_block_to_payload: bool = False,
+        cleaning_callback: Optional[Callable[[etree.Element], etree.Element]] = None,
+        extra_configs: dict = None,
     ):
         self._file_path = file_path
         self._file = file
@@ -128,6 +139,18 @@ class HtmlPartitionerOptions:
         self._image_alt_mode = image_alt_mode
         self._extract_image_block_types = extract_image_block_types
         self._extract_image_block_to_payload = extract_image_block_to_payload
+        self._cleaning_callback = cleaning_callback
+        self._extra_configs = extra_configs or {}
+
+    @lazyproperty
+    def extra_configs(self) -> dict:
+        """Extra configs from kwargs."""
+        return self._extra_configs
+
+    @lazyproperty
+    def cleaning_callback(self) -> Optional[Callable[[etree.Element], etree.Element]]:
+        """An optional callback for custom HTML tree cleaning/transformation."""
+        return self._cleaning_callback
 
     @lazyproperty
     def detection_origin(self) -> str | None:
@@ -149,9 +172,7 @@ class HtmlPartitionerOptions:
         if self._url:
             response = requests.get(self._url, headers=self._headers, verify=self._ssl_verify)
             if not response.ok:
-                raise ValueError(
-                    f"Error status code on GET of provided URL: {response.status_code}"
-                )
+                raise ValueError(f"Error status code on GET of provided URL: {response.status_code}")
             content_type = response.headers.get("Content-Type", "")
             if not content_type.startswith("text/html"):
                 raise ValueError(f"Expected content type text/html. Got {content_type}.")
@@ -215,15 +236,20 @@ class _HtmlPartitioner:
         if not html_text or html_text.strip() == "":
             return
 
-        elements_iter = (
-            self._main.iter_elements()
-            if self._opts.html_parser_version == "v1"
-            else self._from_ontology
-        )
+        elements_iter = self._main.iter_elements() if self._opts.html_parser_version == "v1" else self._from_ontology
 
         for e in elements_iter:
             e.metadata.last_modified = self._opts.last_modified
             e.metadata.detection_origin = self._opts.detection_origin
+
+            # -- transform text to markdown based on preserved original html --
+            try:
+                html_text = getattr(e.metadata, "html_text", None)
+                if html_text:
+                    e.text = markdownify(html_text, **self._opts.extra_configs.get("markdownify_options", {}))
+            except Exception:
+                # keep original text on failure
+                pass
 
             # -- remove <image_base64> if not requested --
             if not self._should_include_image_base64(e):
@@ -250,20 +276,21 @@ class _HtmlPartitioner:
 
         # -- remove a variety of HTML element types like <script> and <style> that we prefer not
         # -- to encounter while parsing.
-        etree.strip_elements(
-            root, ["del", "link", "meta", "noscript", "script", "style"], with_tail=False
-        )
+        etree.strip_elements(root, ["del", "link", "meta", "noscript", "script", "style"], with_tail=False)
 
         # -- remove <header> and <footer> tags if the caller doesn't want their contents --
         if self._opts.skip_headers_and_footers:
             etree.strip_elements(root, ["header", "footer"], with_tail=False)
 
-        # -- jump to the core content if the document indicates where it is --
-        if (main := root.find(".//main")) is not None:
-            return cast(Flow, main)
-        if (body := root.find(".//body")) is not None:
-            return cast(Flow, body)
-        return cast(Flow, root)
+        if self._opts.cleaning_callback:
+            return cast(Flow, self._opts.cleaning_callback(root))
+        else:
+            # -- jump to the core content if the document indicates where it is --
+            if (main := root.find(".//main")) is not None:
+                return cast(Flow, main)
+            if (body := root.find(".//body")) is not None:
+                return cast(Flow, body)
+            return cast(Flow, root)
 
     @lazyproperty
     def _from_ontology(self) -> List[Element]:

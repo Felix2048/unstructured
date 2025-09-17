@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import collections
 import copy
-from typing import Any, Callable, DefaultDict, Iterable, Iterator, cast
+from typing import Any, Callable, DefaultDict, Iterable, Iterator, List, cast
 
 import regex
 from typing_extensions import Self, TypeAlias
@@ -206,32 +206,25 @@ class ChunkingOptions:
     def text_splitting_separators(self) -> tuple[str, ...]:
         """Sequence of text-splitting target strings to be used in order of preference."""
         text_splitting_separators_arg = self._kwargs.get("text_splitting_separators")
-        return (
-            ("\n", " ")
-            if text_splitting_separators_arg is None
-            else tuple(text_splitting_separators_arg)
-        )
+        return ("\n", " ") if text_splitting_separators_arg is None else tuple(text_splitting_separators_arg)
 
     def _validate(self) -> None:
         """Raise ValueError if requestion option-set is invalid."""
         max_characters = self.hard_max
         # -- chunking window must have positive length --
         if max_characters <= 0:
-            raise ValueError(f"'max_characters' argument must be > 0," f" got {max_characters}")
+            raise ValueError(f"'max_characters' argument must be > 0, got {max_characters}")
 
         # -- a negative value for `new_after_n_chars` is assumed to be a mistake the caller will
         # -- want to know about
         new_after_n_chars = self._kwargs.get("new_after_n_chars")
         if new_after_n_chars is not None and new_after_n_chars < 0:
-            raise ValueError(
-                f"'new_after_n_chars' argument must be >= 0," f" got {new_after_n_chars}"
-            )
+            raise ValueError(f"'new_after_n_chars' argument must be >= 0, got {new_after_n_chars}")
 
         # -- overlap must be less than max-chars or the chunk text will never be consumed --
         if self.overlap >= max_characters:
             raise ValueError(
-                f"'overlap' argument must be less than `max_characters`,"
-                f" got {self.overlap} >= {max_characters}"
+                f"'overlap' argument must be less than `max_characters`, got {self.overlap} >= {max_characters}"
             )
 
 
@@ -268,9 +261,7 @@ class PreChunker:
         self._opts = opts
 
     @classmethod
-    def iter_pre_chunks(
-        cls, elements: Iterable[Element], opts: ChunkingOptions
-    ) -> Iterator[PreChunk]:
+    def iter_pre_chunks(cls, elements: Iterable[Element], opts: ChunkingOptions) -> Iterator[PreChunk]:
         """Generate pre-chunks from the element-stream provided on construction."""
         return cls(elements, opts)._iter_pre_chunks()
 
@@ -432,9 +423,7 @@ class PreChunk:
     This object is purposely immutable.
     """
 
-    def __init__(
-        self, elements: Iterable[Element], overlap_prefix: str, opts: ChunkingOptions
-    ) -> None:
+    def __init__(self, elements: Iterable[Element], overlap_prefix: str, opts: ChunkingOptions) -> None:
         self._elements = list(elements)
         self._overlap_prefix = overlap_prefix
         self._opts = opts
@@ -478,9 +467,7 @@ class PreChunk:
         # -- it may need to be split into multiple `TableChunk` elements and that operation is
         # -- quite specialized.
         if len(self._elements) == 1 and isinstance(self._elements[0], Table):
-            yield from _TableChunker.iter_chunks(
-                self._elements[0], self._overlap_prefix, self._opts
-            )
+            yield from _TableChunker.iter_chunks(self._elements[0], self._overlap_prefix, self._opts)
         else:
             yield from _Chunker.iter_chunks(self._elements, self._text, self._opts)
 
@@ -504,9 +491,13 @@ class PreChunk:
             yield self._overlap_prefix
         for e in self._elements:
             if e.text and len(e.text):
-                text = " ".join(e.text.strip().split())
+                text = e.text if e.category in self._non_normalize_element_types else " ".join(e.text.strip().split())
                 if text:
                     yield text
+
+    @property
+    def _non_normalize_element_types(self) -> List[str]:
+        return ["ListBlock", "Table", "TableChunk", "CodeSnippet"]
 
     @lazyproperty
     def _text(self) -> str:
@@ -535,9 +526,7 @@ class _Chunker:
         self._opts = opts
 
     @classmethod
-    def iter_chunks(
-        cls, elements: Iterable[Element], text: str, opts: ChunkingOptions
-    ) -> Iterator[CompositeElement]:
+    def iter_chunks(cls, elements: Iterable[Element], text: str, opts: ChunkingOptions) -> Iterator[CompositeElement]:
         """Form zero or more chunks from `elements`.
 
         One `CompositeElement` is produced when all `elements` will fit. Otherwise there is a
@@ -585,11 +574,7 @@ class _Chunker:
 
         def iter_populated_fields(metadata: ElementMetadata) -> Iterator[tuple[str, Any]]:
             """(field_name, value) pair for each non-None field in single `ElementMetadata`."""
-            return (
-                (field_name, value)
-                for field_name, value in metadata.known_fields.items()
-                if value is not None
-            )
+            return ((field_name, value) for field_name, value in metadata.known_fields.items() if value is not None)
 
         field_values: DefaultDict[str, list[Any]] = collections.defaultdict(list)
 
@@ -700,9 +685,7 @@ class _TableChunker:
         self._opts = opts
 
     @classmethod
-    def iter_chunks(
-        cls, table: Table, overlap_prefix: str, opts: ChunkingOptions
-    ) -> Iterator[Table | TableChunk]:
+    def iter_chunks(cls, table: Table, overlap_prefix: str, opts: ChunkingOptions) -> Iterator[Table | TableChunk]:
         """Split this pre-chunk into `Table` or `TableChunk` objects maxlen or smaller."""
         return cls(table, overlap_prefix, opts)._iter_chunks()
 
@@ -817,9 +800,7 @@ class _TableChunker:
         # -- drop metadata fields not appropriate for chunks, in particular
         # -- parent_id's will not reliably point to an existing element
         drop_field_names = [
-            field_name
-            for field_name, strategy in CS.field_consolidation_strategies().items()
-            if strategy is CS.DROP
+            field_name for field_name, strategy in CS.field_consolidation_strategies().items() if strategy is CS.DROP
         ]
         for field_name in drop_field_names:
             setattr(metadata, field_name, None)
@@ -879,9 +860,7 @@ class _HtmlTableSplitter:
         self._opts = opts
 
     @classmethod
-    def iter_subtables(
-        cls, table_element: HtmlTable, opts: ChunkingOptions
-    ) -> Iterator[TextAndHtml]:
+    def iter_subtables(cls, table_element: HtmlTable, opts: ChunkingOptions) -> Iterator[TextAndHtml]:
         """Generate (text, html) pair for each split of this table pre-chunk.
 
         Each split is on an even row boundary whenever possible, falling back to even cell and even
@@ -1013,9 +992,7 @@ class _TextSplitter:
         separators = self._opts.text_splitting_separators
         return tuple((regex.compile(f"(?r){sep}"), len(sep)) for sep in separators)
 
-    def _split_from_maxlen(
-        self, pattern: regex.Pattern[str], sep_len: int, s: str
-    ) -> tuple[str, str]:
+    def _split_from_maxlen(self, pattern: regex.Pattern[str], sep_len: int, s: str) -> tuple[str, str]:
         """Return (split, remainder) pair split from `s` on the right-most match before `maxlen`.
 
         Returns `"", s` if no suitable match was found. Also returns `"", s` if splitting on this
@@ -1202,9 +1179,7 @@ class _PreChunkAccumulator:
 
     def add_pre_chunk(self, pre_chunk: PreChunk) -> None:
         """Add a pre-chunk to the accumulator for possible combination with next pre-chunk."""
-        self._pre_chunk = (
-            pre_chunk if self._pre_chunk is None else self._pre_chunk.combine(pre_chunk)
-        )
+        self._pre_chunk = pre_chunk if self._pre_chunk is None else self._pre_chunk.combine(pre_chunk)
 
     def flush(self) -> Iterator[PreChunk]:
         """Generate accumulated pre-chunk as a single combined pre-chunk.
